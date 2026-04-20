@@ -1,0 +1,41 @@
+# fly.toml for paperclip-prod
+# Generated 2026-04-20 — bundled server+UI, single process, private authenticated mode.
+# Matt's brief: deploy bundled Paperclip (server + UI in one Node process) on Fly.io.
+# Reviewed against Dockerfile at repo root: EXPOSE 3100, VOLUME /paperclip, env defaults baked in.
+
+app = "paperclip-prod"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Paperclip persists instance state at /paperclip (instances/default/config.json, etc.).
+# Without a mount, everything is lost on every deploy.
+[[mounts]]
+  source = "paperclip_data"
+  destination = "/paperclip"
+
+# USER_UID/GID set to non-1000 so entrypoint (scripts/docker-entrypoint.sh) runs usermod
+# and chown -R node:node /paperclip on boot. Without this the mounted volume stays
+# root:root and the node process hits EACCES on mkdir.
+[env]
+  USER_UID = "1001"
+  USER_GID = "1001"
+
+[http_service]
+  internal_port = 3100
+  force_https = true
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 250
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+  cpus = 1
