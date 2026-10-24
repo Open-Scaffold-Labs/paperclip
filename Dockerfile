@@ -56,6 +56,10 @@ RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @paperclipai/plugin-sdk build
 RUN pnpm --filter @paperclipai/server build
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
+# Bake native library aliases while /app is writable. Fly remaps the runtime
+# user to UID 1001, which cannot create these links in the copied dependency tree.
+RUN node --import ./server/node_modules/tsx/dist/loader.mjs --input-type=module \
+  -e 'import { prepareEmbeddedPostgresNativeRuntime } from "./packages/db/src/embedded-postgres-native.ts"; await prepareEmbeddedPostgresNativeRuntime();'
 
 FROM base AS production
 ARG USER_UID=1000
