@@ -1,0 +1,126 @@
+name: Runtime image verification
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - .github/workflows/runtime-image.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-image-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  runtime-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the final Fly application image locally
+        # fly.toml does not override the Docker target: the final stage is cloud.
+        # Nothing is published to a registry or deployed by this workflow.
+        run: docker buildx build --load --target cloud --tag paperclip-runtime-check --progress plain .
+      - name: Check the image runtime and harmless Brotli decoding
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --interactive paperclip-runtime-check node <<'NODE'
+          const assert = require('node:assert/strict');
+          const zlib = require('node:zlib');
+          assert.equal(process.version, 'v24.22.1');
+          assert.notEqual(process.getuid(), 0, 'the real entrypoint must drop root');
+          const plain = Buffer.from('Paperclip runtime smoke: ordinary Brotli data.');
+          assert.deepEqual(zlib.brotliDecompressSync(zlib.brotliCompressSync(plain)), plain);
+          console.log(JSON.stringify({ node: process.version, brotli: process.versions.brotli, uid: process.getuid() }));
+          NODE
+      - name: Boot with a fresh embedded database and verify the auth boundary
+        # The container has no external network and no host/config mounts. The
+        # temporary volume begins empty; no existing companies, jobs or keys are
+        # copied. UID/GID match Fly's existing remap so volume permissions are tested.
+        run: |
+          set -euo pipefail
+          docker volume create paperclip-runtime-check >/dev/null
+          docker run --detach --name paperclip-runtime-smoke --network none \
+            --mount type=volume,source=paperclip-runtime-check,target=/paperclip \
+            --env USER_UID=1001 --env USER_GID=1001 \
+            --env BETTER_AUTH_SECRET=isolated-runtime-check-not-a-deployed-secret \
+            --env PAPERCLIP_PUBLIC_URL=http://127.0.0.1:3100 \
+            --env HEARTBEAT_SCHEDULER_ENABLED=false \
+            --env PAPERCLIP_DB_BACKUP_ENABLED=false \
+            paperclip-runtime-check
+          docker exec --interactive --user 1001:1001 paperclip-runtime-smoke node <<'NODE'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+          async function get(path) {
+            return fetch('http://127.0.0.1:3100' + path, { signal: AbortSignal.timeout(5_000) });
+          }
+          (async () => {
+            let ready = false;
+            for (let attempt = 0; attempt < 180; attempt++) {
+              try {
+                const response = await get('/api/health');
+                if (response.status === 200) {
+                  const body = await response.json();
+                  assert.equal(body.status, 'ok');
+                  assert.equal(body.deploymentMode, 'authenticated');
+                  assert.equal(body.bootstrapStatus, 'bootstrap_pending');
+                  ready = true;
+                  break;
+                }
+              } catch (error) {
+                if (error.name === 'AssertionError') throw error;
+              }
+              await delay(1_000);
+            }
+            assert.equal(ready, true, 'container did not finish embedded-DB startup within 180 attempts');
+            const uid = Number(fs.readFileSync('/proc/1/status', 'utf8').match(/^Uid:\s+(\d+)/m)?.[1]);
+            assert.equal(uid, 1001, 'entrypoint must run the server as the remapped non-root user');
+            assert.ok(fs.existsSync('/paperclip/instances/default/db/PG_VERSION'), 'embedded PostgreSQL must initialize on the temporary volume');
+            const page = await get('/');
+            assert.equal(page.status, 200);
+            assert.match(await page.text(), /<script[^>]+src=["'][^"']*\/assets\//);
+            for (const headers of [{}, { authorization: 'Bearer deliberately-invalid-runtime-smoke-key' }]) {
+              const response = await fetch('http://127.0.0.1:3100/api/companies', {
+                headers, signal: AbortSignal.timeout(5_000),
+              });
+              assert.equal(response.status, 403, 'anonymous and invalid-key requests must not read board data');
+              assert.equal((await response.json()).error, 'Board access required');
+            }
+            // A positive session control prevents a generic rejection/missing
+            // route from masquerading as a working authentication boundary.
+            const signup = await fetch('http://127.0.0.1:3100/api/auth/sign-up/email', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', origin: 'http://127.0.0.1:3100' },
+              body: JSON.stringify({ name: 'Runtime smoke', email: 'runtime-smoke@example.test', password: 'isolated-runtime-smoke-password' }),
+              signal: AbortSignal.timeout(15_000),
+            });
+            assert.equal(signup.ok, true, 'isolated account signup failed');
+            const cookies = signup.headers.getSetCookie().map(value => value.split(';', 1)[0]).join('; ');
+            assert.ok(cookies.length > 0, 'signup must establish a session');
+            const session = await fetch('http://127.0.0.1:3100/api/auth/get-session', {
+              headers: { cookie: cookies }, signal: AbortSignal.timeout(5_000),
+            });
+            assert.equal(session.status, 200);
+            assert.equal((await session.json()).user.email, 'runtime-smoke@example.test');
+            const companies = await fetch('http://127.0.0.1:3100/api/companies', {
+              headers: { cookie: cookies }, signal: AbortSignal.timeout(5_000),
+            });
+            assert.equal(companies.status, 200);
+            assert.deepEqual(await companies.json(), [], 'disposable database must contain no copied companies');
+            console.log('Container entrypoint, embedded PostgreSQL, static UI, remapped UID, auth refusals and session checks passed.');
+          })().catch(error => { console.error(error); process.exitCode = 1; });
+          NODE
+      - name: Show failure diagnostics
+        if: failure()
+        run: docker logs --tail 150 paperclip-runtime-smoke 2>&1 || true
+      - name: Remove the disposable container and database volume
+        if: always()
+        run: |
+          docker rm --force paperclip-runtime-smoke >/dev/null 2>&1 || true
+          docker volume rm paperclip-runtime-check >/dev/null 2>&1 || true

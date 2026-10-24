@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1.20
-FROM node:lts-trixie-slim AS base
+# Node 24.22.1 contains the CVE-2026-111497 Brotli decoder backport.
+FROM node:24.22.1-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea AS base
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \
@@ -55,6 +56,10 @@ RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @paperclipai/plugin-sdk build
 RUN pnpm --filter @paperclipai/server build
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
+# Bake native library aliases while /app is writable. Fly remaps the runtime
+# user to UID 1001, which cannot create these links in the copied dependency tree.
+RUN node --import ./server/node_modules/tsx/dist/loader.mjs --input-type=module \
+  -e 'import { prepareEmbeddedPostgresNativeRuntime } from "./packages/db/src/embedded-postgres-native.ts"; await prepareEmbeddedPostgresNativeRuntime();'
 
 FROM base AS production
 ARG USER_UID=1000
@@ -65,7 +70,9 @@ ARG USER_GID=1000
 ARG PAPERCLIP_BUILD_VERSION=""
 WORKDIR /app
 COPY --chown=node:node --from=build /app /app
-RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest \
+# Keep the installed agent CLI versions observed on paperclip-prod on 2026-10-23.
+# The security rebuild must not also upgrade the agent harnesses.
+RUN npm install --global --omit=dev @anthropic-ai/claude-code@2.1.220 @openai/codex@0.145.0 opencode-ai@1.18.7 @google/gemini-cli@0.52.0 \
   && apt-get update \
   && apt-get install -y --no-install-recommends openssh-client jq \
   && rm -rf /var/lib/apt/lists/* \
